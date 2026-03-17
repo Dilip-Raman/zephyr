@@ -1026,6 +1026,41 @@ static void work_timeout(struct _timeout *to)
 	 * If not successful there is no notification that the work has been
 	 * abandoned.  Sorry.
 	 */
+
+	/*
+	 * Two conditions MUST both be true before we submit:
+	 *
+	 * 1. K_WORK_DELAYED_BIT is set
+	 * 	confirms this work item is still in a scheduled state
+	 *
+	 * 2. dw->timeout.node is NOT linked
+	 * 	confirms no concurrent reschedule won the preemption..!
+	 *
+	 * If condition 2 is false (node IS linked), it means a higher-priority
+	 * ISR called k_work_reschedule_for_queue() between remove_timeout() and
+	 * this callback. that isr..!
+	 * - Cleared DELAYED_BIT via unschedule_locked()
+	 * - Set DELAYED_BIT again via schedule_for_queue_locked()
+	 * - Called z_add_timeout() which RE-LINKED the node
+	 *
+	 *  In that case: we must NOT to  submit.
+	 *  DELAYED_BIT belongs to the new timeout. The new timeout will call work_timeout()
+	 *  when it fires at which point the node will be unlinked and we submit correctly.
+	 *
+	 *  Safety of sys_dnode_is_linked() under work lock:
+	 *  	ALL code paths that link/unlink dw->timeout.node require the work
+	 *  	lock FIRST (schedule_for_queue_locked, unschedule_locked). Since
+	 *  	we hold the work lock here, the node  state cannot change under us.
+	 *  	This is safe on both single-core and SMP.
+	 *
+	 *    if (flag_test(&wp->flags, K_WORK_DELAYED_BIT) &&
+	 *    			!sys_dnode_is_linked(&dw->timeout.node)) {
+	 *    		flag_clear(&wp->flags, K_WORK_DELAYED_BIT);
+	 *    		queue = dw->queue;
+	 *    		(void)submit_to_queue_locked(wp, &queue);
+	 *    		}
+	 */
+
 	if (flag_test_and_clear(&wp->flags, K_WORK_DELAYED_BIT)) {
 		queue = dw->queue;
 		(void)submit_to_queue_locked(wp, &queue);
