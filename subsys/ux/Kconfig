@@ -1,0 +1,105 @@
+# Copyright (c) 2026 Aerlync Labs Inc.
+# SPDX-License-Identifier: Apache-2.0
+
+menuconfig UX
+	bool "UX"
+	help
+	  Priority-based UX notification framework.
+
+if UX
+
+module = UX
+module-str = ux
+source "subsys/logging/Kconfig.template.log_config"
+
+#TODO: overwrite thread init priority need to set.
+
+config UX_THREAD_PRIORITY
+	int "Dispatcher thread kernel priority"
+	default 90
+	help
+	  Set thread priority of the ux.
+
+config UX_MAX_PRIORITIES
+	int "Maximum concurrent priority levels"
+	default 8
+	range 2 32
+	help
+	  Size of the static sorted priority queue. Each slot holds a full
+	  copy of struct ux_event (~12 bytes).
+
+config UX_FIFO_POOL_SIZE
+	int "FIFO item pool size"
+	default 8
+	range 4 64
+	help
+	  Number of pre-allocated items in the k_mem_slab used for the
+	  ux_fifo. Each ux_notify() and ux_clear() call consumes one item
+	  for the duration of the dispatcher thread's processing cycle.
+
+config UX_THREAD_STACK_SIZE
+	int "Dispatcher thread stack size (bytes)"
+	default 1024
+	help
+	  Stack for the UX dispatcher thread.
+
+config UX_LOG_LEVEL
+	int "UX subsystem log level"
+	default 3
+	range 0 4
+	help
+	  0 = OFF, 1 = ERR, 2 = WRN, 3 = INF, 4 = DBG.
+
+#TODO: Need to add the led_strip and pwm for backend support
+
+config UX_LED
+	bool "LED indication handler"
+	depends on GPIO || PWM || LED_STRIP
+	help
+	  Enable the LED indication handler.
+
+if UX_LED
+
+config UX_LED_UPDATE_PERIOD_MS
+	int "Interpolation tick period (ms)"
+	default 20
+	range 10 100
+	help
+	  Update interval for LINEAR and BREATHING colour transitions.
+	  20 ms (50 Hz), they use one wake per step.
+
+config UX_LED_INIT_PRIORITY
+	int "LED handler SYS_INIT priority"
+	default 91
+	help
+	  SYS_INIT APPLICATION-level priority. Must be greater than (runs
+	  later than) the GPIO or PWM subsystem it depends on.
+
+choice UX_LED_BACKEND
+	prompt "LED backend"
+	default UX_LED_BACKEND_GPIO
+	help
+	  Select the hardware backend for the UX LED handler.
+
+config UX_LED_BACKEND_GPIO
+	bool "GPIO LED backend"
+	depends on GPIO
+	select GPIO
+	help
+	  GPIO-controlled LED via DT alias "led0".
+
+config UX_LED_BACKEND_PWM
+	bool "PWM_RGB"
+	depends on PWM
+	help
+	  PWM-driven RGB LED via the "pwm-led0" devicetree alias.
+
+endif # UX_LED_BACKEND
+
+endif #UX_LED
+
+#TODO: Need to handle other module config.
+
+endif # UX
+
+endmenu
