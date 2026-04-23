@@ -1,0 +1,90 @@
+# Copyright (c) 2026 Aerlync Labs Inc.
+# SPDX-License-Identifier: Apache-2.0
+#
+# DT binding for the MCUmgr SMP over I2C transport node.
+#
+# Placement in Zephyr tree:
+#   dts/bindings/misc/zephyr,smp-i2c-transport.yaml
+#
+# This binding describes a logical transport node - NOT a child of the I2C
+# bus node. Placing it as a child of the I2C bus would inherit the I2C bus
+# binding (e.g., nordic,nrf-twis.yaml) which does NOT declare our custom
+# properties, causing DTS validation failures.
+#
+# Usage in a board overlay:
+#
+# The simplest approach is to add `data-ready-gpios` directly to the I2C
+# peripheral node and point the "smp-i2c-bus" alias at that node:
+#
+#   &i2c1 {
+#       compatible = "nordic,nrf-twis";
+#       status = "okay";
+#       pinctrl-0 = <&i2c1_default>;
+#       pinctrl-names = "default";
+#       /* Optional DRDY signal: */
+#       data-ready-gpios = <&gpio0 4 GPIO_ACTIVE_HIGH>;
+#   };
+#
+#   / {
+#       aliases {
+#           smp-i2c-bus = &i2c1;
+#       };
+#   };
+#
+# If the I2C peripheral binding does not allow data-ready-gpios (because the
+# upstream DTS binding schema is strict), use a standalone transport node:
+#
+#   / {
+#       smp_i2c_transport: smp-i2c-transport {
+#           compatible = "zephyr,smp-i2c-transport";
+#           i2c-bus = <&i2c1>;
+#           data-ready-gpios = <&gpio0 4 GPIO_ACTIVE_HIGH>;
+#       };
+#
+#       aliases {
+#           smp-i2c-bus = &smp_i2c_transport;
+#       };
+#   };
+
+description: MCUmgr SMP over I2C target (peripheral) transport
+
+compatible: "zephyr,smp-i2c-transport"
+
+include: base.yaml
+
+properties:
+  i2c-bus:
+    type: phandle
+    required: true
+    description: |
+      Phandle reference to the I2C peripheral this transport registers on.
+      The referenced peripheral must be configured for I2C target (peripheral)
+      mode via its own compatible (e.g., "nordic,nrf-twis") and have
+      CONFIG_I2C_TARGET=y selected in the build.
+
+      Example:
+        i2c-bus = <&i2c1>;
+
+  data-ready-gpios:
+    type: phandle-array
+    required: false
+    description: |
+      Optional GPIO signal asserted HIGH when an SMP response is ready for
+      the I2C controller to read. When present, the controller can use a
+      rising-edge interrupt instead of polling read transactions.
+
+      The GPIO is de-asserted by the target after the controller successfully
+      reads the full response (detected via the STOP callback).
+
+      Must reference an output-capable GPIO pin. Configure as GPIO_OUTPUT
+      on the target side; configure as GPIO_INPUT + interrupt on the
+      controller side.
+
+      Active polarity follows the GPIO flags field.
+
+      Example (active-high, direct connection):
+        data-ready-gpios = <&gpio0 4 GPIO_ACTIVE_HIGH>;
+
+      When absent, the transport operates in polling mode: the controller
+      detects response availability by reading [0x00][0x00] (not ready)
+      versus a non-zero length prefix.

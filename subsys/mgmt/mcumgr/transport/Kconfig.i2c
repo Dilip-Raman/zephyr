@@ -1,0 +1,59 @@
+# Copyright (c) 2026 Aerlync Labs Inc.
+# SPDX-License-Identifier: Apache-2.0
+
+menuconfig MCUMGR_TRANSPORT_I2C
+	bool "I2C target MCUmgr SMP transport"
+	depends on I2C
+	depends on I2C_TARGET
+	help
+	  Enables MCUmgr SMP server over I2C. The device acts as an I2C
+	  target at a fixed 7-bit address. The controller sends SMP requests
+	  as I2C write transactions and reads responses via I2C read transactions.
+
+	  Wire protocol: [2B BE length][raw SMP packet]. When no response is
+	  buffered the target returns [0x00][0x00] to signal "not ready".
+
+	  Requires a devicetree alias "smp-i2c-bus" pointing to the I2C
+	  peripheral configured for target mode.
+
+if MCUMGR_TRANSPORT_I2C
+
+config MCUMGR_TRANSPORT_I2C_ADDR
+	hex "I2C target address"
+	range 0x08 0x77
+	default 0x55
+	help
+	  7-bit address this transport listens on. Must match the address the
+	  I2C controller uses when sending SMP commands. Default 0x55 avoids
+	  the I2C reserved ranges (0x00-0x07, 0x78-0x7F).
+
+config MCUMGR_TRANSPORT_I2C_MTU
+	int "Maximum SMP payload size (bytes)"
+	range 64 65535
+	default 512
+	help
+	  Largest SMP frame this transport can send or receive. Must not
+	  exceed CONFIG_MCUMGR_TRANSPORT_NETBUF_SIZE. Must match the MTU
+	  configured on the I2C controller side.
+
+config MCUMGR_TRANSPORT_I2C_DATA_READY_GPIO
+	bool "Assert a data-ready GPIO when response is buffered"
+	depends on GPIO
+	help
+	  When enabled, the transport drives a GPIO output HIGH after staging
+	  a response. The controller can use a rising-edge interrupt on that
+	  GPIO instead of issuing repeated poll reads. The GPIO is de-asserted
+	  after the controller reads the full response.
+
+	  The pin is specified in the devicetree node referenced by the
+	  "smp-i2c-bus" alias:
+	    data-ready-gpios = <&gpio0 4 GPIO_ACTIVE_HIGH>;
+
+	  Without this option the controller must poll: issue a 2-byte READ
+	  and inspect the length prefix — [0x00][0x00] means not ready.
+
+module = MCUMGR_TRANSPORT_I2C
+module-str = I2C SMP transport
+source "subsys/logging/Kconfig.template.log_config"
+
+endif # MCUMGR_TRANSPORT_I2C

@@ -1,0 +1,25 @@
+# SPDX-License-Identifier: Apache-2.0
+
+description: |
+  MCUmgr SMP transport over I2C (target/peripheral role).
+
+  The node must be a child of an i2c-target-compatible node.
+  The reg property defines the 7-bit I2C address at which this
+  device presents itself as an SMP management target.
+
+  Example:
+    &i2c0 {
+        smp_i2c_target: smp-i2c@2a {
+            compatible = "zephyr,smp-i2c";
+            reg = <0x2a>;
+        };
+    };
+
+compatible: "zephyr,smp-i2c"
+
+include: i2c-device.yaml
+
+properties:
+  reg:
+    required: true
+    description: 7-bit I2C address of this SMP management target.

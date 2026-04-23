@@ -163,6 +163,8 @@ enum smp_transport_type {
 	SMP_UDP_IPV6_TRANSPORT,
 	/** SMP LoRaWAN */
 	SMP_LORAWAN_TRANSPORT,
+	/** SMP I2C */
+	SMP_I2C_TRANSPORT,
 	/** SMP user defined type */
 	SMP_USER_DEFINED_TRANSPORT
 };
@@ -221,6 +223,11 @@ void smp_client_transport_register(struct smp_client_transport_entry *entry);
  * @return		Pointer to registered object. Unknown type return NULL.
  */
 struct smp_transport *smp_client_transport_get(int smpt_type);
+
+/**
+ * @brief SMP layer out conversion to i2c data format
+ */
+void smp_data_frmt_i2c(struct smp_i2c_frmt);
 
 /**
  * @}
