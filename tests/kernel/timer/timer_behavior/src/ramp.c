@@ -35,6 +35,16 @@ static void tm_fn(struct k_timer *tm)
  */
 ZTEST(timer_ramp, test_timer_ramp)
 {
+	TC_PRINT("=== DEBUG INFO ===\n");
+	TC_PRINT("sys_clock_hw_cycles_per_sec() = %u\n", sys_clock_hw_cycles_per_sec());
+	TC_PRINT("CONFIG_SYS_CLOCK_HW_CYCLES_PER_SEC = %u\n", CONFIG_SYS_CLOCK_HW_CYCLES_PER_SEC);
+	TC_PRINT("CONFIG_SYS_CLOCK_TICKS_PER_SEC = %u\n", CONFIG_SYS_CLOCK_TICKS_PER_SEC);
+	TC_PRINT("Cycles per tick = %u / %u = %.6f\n",
+			sys_clock_hw_cycles_per_sec(),
+			CONFIG_SYS_CLOCK_TICKS_PER_SEC,
+			(double)sys_clock_hw_cycles_per_sec() / CONFIG_SYS_CLOCK_TICKS_PER_SEC);
+	TC_PRINT("==================\n");
+
 	bool failed = false;
 	struct k_timer tm;
 	uint32_t delay = 1;
@@ -48,14 +58,20 @@ ZTEST(timer_ramp, test_timer_ramp)
 
 		uint32_t delta_cycles = end_cycle - start_cycle;
 		uint32_t delta_ticks = k_cyc_to_ticks_floor32(delta_cycles);
+		double expected_cycles = (double)delay * sys_clock_hw_cycles_per_sec() / CONFIG_SYS_CLOCK_TICKS_PER_SEC;
+		double tick_precision_loss = delta_cycles - (delta_ticks * sys_clock_hw_cycles_per_sec() / CONFIG_SYS_CLOCK_TICKS_PER_SEC);
+
+		TC_PRINT("delay=%d ticks, delta=%d ticks (%d cycles), expected=%.2f cycles, loss=%.2f cycles\n",
+				delay, delta_ticks, delta_cycles, expected_cycles, tick_precision_loss);
+
 
 		if (delta_ticks > (delay + 1) || delta_ticks < delay) {
 			TC_PRINT("failed: delay of %d ticks , actual %d (%d cycles)\n", delay,
-				 delta_ticks, delta_cycles);
+					delta_ticks, delta_cycles);
 			failed = true;
 		} else {
 			TC_PRINT("passed: delay of %d ticks, actual %d (%d cycles)\n", delay,
-				 delta_ticks, delta_cycles);
+					delta_ticks, delta_cycles);
 		}
 		delay = delay*2;
 	}
