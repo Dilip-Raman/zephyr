@@ -227,16 +227,29 @@ static int mbox_message_put(struct k_mbox *mbox, struct k_mbox_msg *tx_msg,
 
 	SYS_PORT_TRACING_OBJ_FUNC_ENTER(k_mbox, message_put, mbox, timeout);
 
-	_WAIT_Q_FOR_EACH(&mbox->rx_msg_queue, receiving_thread) {
-		rx_msg = (struct k_mbox_msg *)receiving_thread->base.swap_data;
+	struct k_thread *matching_thread = NULL;
 
-		if (mbox_message_match(tx_msg, rx_msg) == 0) {
-			/* take receiver out of rx queue */
-			z_unpend_thread(receiving_thread);
+	K_SPINLOCK(&_sched_spinlock) {
+		_WAIT_Q_FOR_EACH(&mbox->rx_msg_queue, receiving_thread) {
+			rx_msg = (struct k_mbox_msg *)receiving_thread->base.swap_data;
 
-			/* ready receiver for execution */
-			arch_thread_return_value_set(receiving_thread, 0);
-			z_ready_thread(receiving_thread);
+			if (mbox_message_match(tx_msg, rx_msg) == 0) {
+				/* take receiver out of rx queue */
+				unpend_thread_no_timeout(receiving_thread);
+				(void)z_try_abort_thread_timeout(receiving_thread);
+
+				/* ready receiver for execution */
+				arch_thread_return_value_set(receiving_thread, 0);
+				z_sched_ready_locked(receiving_thread);
+
+				matching_thread = receiving_thread;
+				break;
+			}
+		}
+	}
+
+	if (matching_thread != NULL) {
+		receiving_thread = matching_thread;
 
 #if (CONFIG_NUM_MBOX_ASYNC_MSGS > 0)
 			/*
@@ -265,7 +278,6 @@ static int mbox_message_put(struct k_mbox *mbox, struct k_mbox_msg *tx_msg,
 			SYS_PORT_TRACING_OBJ_FUNC_EXIT(k_mbox, message_put, mbox, timeout, ret);
 
 			return ret;
-		}
 	}
 
 	/* didn't find a matching receiver: don't wait for one */
@@ -397,21 +409,31 @@ int k_mbox_get(struct k_mbox *mbox, struct k_mbox_msg *rx_msg, void *buffer,
 
 	SYS_PORT_TRACING_OBJ_FUNC_ENTER(k_mbox, get, mbox, timeout);
 
-	_WAIT_Q_FOR_EACH(&mbox->tx_msg_queue, sending_thread) {
-		tx_msg = (struct k_mbox_msg *)sending_thread->base.swap_data;
+	struct k_thread *matching_thread = NULL;
 
-		if (mbox_message_match(tx_msg, rx_msg) == 0) {
-			/* take sender out of mailbox's tx queue */
-			z_unpend_thread(sending_thread);
+	K_SPINLOCK(&_sched_spinlock) {
+		_WAIT_Q_FOR_EACH(&mbox->tx_msg_queue, sending_thread) {
+			tx_msg = (struct k_mbox_msg *)sending_thread->base.swap_data;
 
-			k_spin_unlock(&mbox->lock, key);
+			if (mbox_message_match(tx_msg, rx_msg) == 0) {
+				/* take sender out of mailbox's tx queue */
+				unpend_thread_no_timeout(sending_thread);
+				(void)z_try_abort_thread_timeout(sending_thread);
 
-			/* consume message data immediately, if needed */
-			result = mbox_message_data_check(rx_msg, buffer);
-
-			SYS_PORT_TRACING_OBJ_FUNC_EXIT(k_mbox, get, mbox, timeout, result);
-			return result;
+				matching_thread = sending_thread;
+				break;
+			}
 		}
+	}
+
+	if (matching_thread != NULL) {
+		k_spin_unlock(&mbox->lock, key);
+
+		/* consume message data immediately, if needed */
+		result = mbox_message_data_check(rx_msg, buffer);
+
+		SYS_PORT_TRACING_OBJ_FUNC_EXIT(k_mbox, get, mbox, timeout, result);
+		return result;
 	}
 
 	/* didn't find a matching sender */
