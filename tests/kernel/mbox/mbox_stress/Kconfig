@@ -1,0 +1,105 @@
+# Copyright (c) 2026 Aerlync Labs Inc.
+#
+# SPDX-License-Identifier: Apache-2.0
+
+source "Kconfig.zephyr"
+
+config MAILBOX_STRESS_N_SENDERS
+	int "Number of sender threads"
+	range 1 8
+	default 2
+	help
+	  Number of threads that keep sending messages.
+
+config MAILBOX_STRESS_N_RECVERS
+	int "Number of receiver threads"
+	range 1 8
+	default 2
+	help
+	  Number of threads that keep receiving messages.
+
+config MAILBOX_STRESS_N_BYSTANDERS
+	int "Number of bystander receiver threads (never matched)"
+	range 0 8
+	default 1
+	help
+	  Extra receivers that never actually receive anything. They wait
+	  at the head of the receive queue and time out constantly, so a
+	  sender has to walk past them while their timeouts can fire --
+	  the exact interleaving that triggers the SMP wait-queue walk
+	  race. 0 disables them.
+
+config MAILBOX_STRESS_ASYNC
+	bool "Use asynchronous sends (k_mbox_async_put)"
+	default y
+	help
+	  When enabled, senders use k_mbox_async_put() with a per-sender
+	  semaphore. Otherwise they use synchronous k_mbox_put().
+
+config MAILBOX_STRESS_TARGETED
+	bool "Target messages at specific receivers"
+	default y
+	help
+	  When enabled, sender n targets receiver (n % N_RECVERS). The
+	  other receivers stay waiting at the head of the queue, so a
+	  sender must walk past them to find its target.
+
+	  When disabled, all messages target any receiver (K_ANY), so a
+	  sender always matches the head of the queue and never walks.
+
+config MAILBOX_STRESS_RECV_TIMEOUT_US
+	int "Receiver k_mbox_get() timeout in microseconds"
+	range 0 1000000
+	default 100
+	help
+	  Receiver timeout. Short values make timeouts fire often, which
+	  stresses the race. 0 means no wait.
+
+config MAILBOX_STRESS_SEND_TIMEOUT_MS
+	int "Sender k_mbox_put() timeout in milliseconds (sync mode only)"
+	range 0 100000
+	default 0
+	help
+	  Sender timeout for synchronous sends (only used when ASYNC is
+	  disabled). 0 means wait forever. A finite value also stresses
+	  the sender-side wait queue.
+
+config MAILBOX_STRESS_MSG_SIZE
+	int "Message payload size in bytes"
+	range 0 256
+	default 32
+	help
+	  Payload size sent and received. 0 exercises the no-data path.
+
+config MAILBOX_STRESS_VERIFY
+	bool "Verify transferred data"
+	default y
+	help
+	  Check every received byte against the pattern encoded in the
+	  message info field. Catches data corruption from races.
+
+config MAILBOX_STRESS_ITERS
+	int "Iterations per thread"
+	range 1 1000000000
+	default 250000
+	help
+	  How many messages each thread sends or receives before it
+	  stops. The default gives roughly a minute of runtime on
+	  qemu_x86_64 with 2 CPUs, which is long enough for the race to
+	  hit on a buggy kernel.
+
+config MAILBOX_STRESS_WATCHDOG_SEC
+	int "Watchdog reporting period in seconds"
+	range 1 60
+	default 5
+	help
+	  How often the watchdog prints overall progress. If progress
+	  does not advance between two checks, the mailbox is wedged and
+	  the test fails.
+
+config MAILBOX_STRESS_STACK_SIZE
+	int "Stack size for stress threads"
+	range 512 65536
+	default 2048
+	help
+	  Stack size for the sender and receiver threads.
