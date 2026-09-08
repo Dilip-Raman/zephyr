@@ -27,4 +27,8 @@
 #define IFX_HPPASS_SAR_FIFO_2        3
 #define IFX_HPPASS_SAR_FIFO_3        4
 
+/* Filter outputs, readable as ADC channels. */
+#define IFX_HPPASS_SAR_FIR0_CHANNEL 30
+#define IFX_HPPASS_SAR_FIR1_CHANNEL 31
+
 #endif /* ZEPHYR_INCLUDE_DT_BINDINGS_ADC_INFINEON_HPPASS_SAR_H_ */

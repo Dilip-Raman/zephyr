@@ -1,0 +1,80 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 Infineon Technologies AG,
+# SPDX-FileCopyrightText: or an affiliate of Infineon Technologies AG. All rights reserved.
+#
+# SPDX-License-Identifier: Apache-2.0
+
+title: HPPASS SAR ADC FIR Filter
+
+description: |
+  One of the two 16-tap FIR filters in the Infineon HPPASS SAR ADC.
+
+  A filter takes the result of a single SAR channel and produces a filtered
+  value from that channel's conversions, held back until the taps fill if
+  infineon,wait-tap-init is set. The hardware numbers the filtered value as a
+  channel of its own, 30 for FIR0 and 31 for FIR1, so it can be read with
+  adc_read(), routed to a FIFO buffer with fifo-sel, or fetched through the
+  vendor API.
+
+  Reading channel 30 or 31 does not convert the filter's input channel. It
+  returns the latest value the filter has produced, which may predate the
+  conversions taken in the same adc_read(). The read fails with -EAGAIN while
+  the filter has no result to report, which is the case until it first runs
+  and again after new coefficients are loaded.
+
+  Only a filter whose taps are all nonnegative and sum to at most one keeps its
+  output inside the 0 to 4095 the channel metadata describes, so only such a
+  filter can be read this way. Any other tap set, including one with negative
+  taps, can produce values outside that range and is rejected with -ENOTSUP;
+  read it through the vendor API or a FIFO buffer instead.
+
+  Filter nodes are named "fir-0" and "fir-1" under the SAR ADC node.
+
+compatible: "infineon,hppass-sar-fir"
+
+properties:
+  infineon,input-channel:
+    type: int
+    required: true
+    description: |
+      SAR channel (0 to 27) whose results feed this filter. The channel must
+      also be described by a channel node on the ADC.
+
+  infineon,coefficients:
+    type: array
+    required: true
+    description: |
+      Exactly 16 filter coefficients in Q1.15 two's complement, one per tap;
+      the value is the fraction multiplied by 32768. Cells are 32-bit, so a
+      negative coefficient is written sign-extended.
+
+      Examples:
+         0.25 = 0x2000 (8192)
+        -0.25 = 0xFFFFE000 (-8192)
+         0.5  = 0x4000 (16384)
+
+      The sum of the absolute values must stay below 8, otherwise the 16-bit
+      result overflows. A 16-tap moving average is 16 entries of 0x0800.
+
+  infineon,wait-tap-init:
+    type: boolean
+    description: |
+      Hold the output back until all 16 taps have been filled, so nothing is
+      reported from a partially primed filter. The hold is 16 samples whatever
+      the tap count. Left out, the filter reports from its first sample and the
+      leading values ramp up as the delay line fills.
+
+  infineon,result-interrupt:
+    type: boolean
+    description: |
+      Raise an interrupt each time this filter produces a value. This fires
+      once per source conversion, so prefer routing the filter to a
+      FIFO buffer with fifo-sel when sampling continuously.
+
+  fifo-sel:
+    type: int
+    default: 0
+    enum: [0, 1, 2, 3, 4]
+    description: |
+      Route this filter's output to a FIFO buffer.
+      Use the IFX_HPPASS_SAR_FIFO_* macros:
+      DISABLED (0, default), FIFO_0 (1), FIFO_1 (2), FIFO_2 (3), FIFO_3 (4).
