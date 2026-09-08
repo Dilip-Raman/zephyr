@@ -90,6 +90,12 @@ child-binding:
     number 0 to 27. Channels 0 to 11 are the direct samplers; 12 to 27 reach
     the four muxed samplers, four channels each.
 
+    Channels 30 and 31 are the outputs of the two FIR filters. Add one of those
+    only to read a filter with adc_read(); the filter itself is configured on
+    the matching "fir-0" or "fir-1" node. The zephyr,gain, zephyr,reference and
+    zephyr,acquisition-time values are not applied to such a node, since no
+    sampler sits behind it.
+
   properties:
     fifo-sel:
       type: int
