@@ -28,6 +28,7 @@
 #include <zephyr/logging/log.h>
 #include <zephyr/sys/byteorder.h>
 #include <zephyr/sys/util.h>
+#include <string.h>
 #include <zephyr/sys/sys_io.h>
 #include <zephyr/irq.h>
 #include <zephyr/dt-bindings/adc/infineon-hppass-sar.h>
@@ -145,8 +146,22 @@ const cy_stc_hppass_sar_t ifx_hppass_sar_pdl_cfg_struct_default = {
 BUILD_ASSERT(ADC_IFX_HPPASS_SAR_FIFO_STATUS(0) == CY_HPPASS_INTR_FIFO_0_LEVEL);
 BUILD_ASSERT(ADC_IFX_HPPASS_SAR_FIFO_STATUS(3) == CY_HPPASS_INTR_FIFO_3_LEVEL);
 
+/* Taps are Q1.15 with 1/2^15 resolution, so 32768 is 1.0, and the 16-bit result
+ * overflows once they sum to 8 (Regs TRM §20.1.40).
+ */
+#define IFX_HPPASS_SAR_FIR_UNITY_GAIN 32768
+#define IFX_HPPASS_SAR_FIR_GAIN_LIMIT (8 * IFX_HPPASS_SAR_FIR_UNITY_GAIN)
+
 /* 28-channel mask, OR'd into CFG_RESULT_MASK (Regs TRM §20.1.18). */
 #define IFX_HPPASS_SAR_CHAN_MSK            ((1UL << HPPASS_SAR_ADC_MAX_CHANNELS) - 1UL)
+
+/* Filter results land in RESULT_UPDATED[31:30], so they are channels 30 and 31
+ * (Regs TRM §20.1.19).
+ */
+#define IFX_HPPASS_SAR_FIR_MSK (CY_HPPASS_SAR_FIR_0_MSK | CY_HPPASS_SAR_FIR_1_MSK)
+
+/* Per-channel arrays are indexed by channel, so they have to reach 31. */
+#define IFX_HPPASS_SAR_CHAN_SLOTS (CY_HPPASS_SAR_FIR_1_IDX + 1U)
 
 /* SAMPLE_TIME is 10-bit and the aperture is the field plus one (Regs TRM §20.1.10). */
 #define IFX_HPPASS_SAR_SAMP_TIME_MAX 1024
@@ -221,6 +236,16 @@ struct ifx_hppass_sar_fifo_config {
 	uint8_t watermark_mask;
 };
 
+struct ifx_hppass_sar_fir_config {
+	uint8_t input_channel;
+	int16_t coef[CY_HPPASS_FIR_TAP_NUM];
+	uint8_t fifo_sel;
+	/* Hold the output until all 16 taps have filled (Arch TRM §27.2.2.6). */
+	bool wait_tap_init;
+	bool result_interrupt;
+	bool declared;
+};
+
 struct ifx_hppass_sar_adc_config {
 	const struct device *mfd;
 	/*
@@ -232,6 +257,7 @@ struct ifx_hppass_sar_adc_config {
 	void (*irq_func)(void);
 	uint16_t dir_samp_en_mask;
 	uint16_t mux_samp_en_mask;
+	uint32_t channel_mask;
 	bool vref_internal_source;
 	bool gain_cal;
 	bool offset_cal;
@@ -242,7 +268,9 @@ struct ifx_hppass_sar_adc_config {
 	bool fifo_irq_present;
 	bool fifo_chan_id;
 	struct ifx_hppass_sar_fifo_config fifo;
-	uint8_t chan_fifo_sel[CY_HPPASS_SAR_CHAN_NUM];
+	uint8_t chan_fifo_sel[IFX_HPPASS_SAR_CHAN_SLOTS];
+	struct ifx_hppass_sar_fir_config fir[CY_HPPASS_FIR_NUM];
+	uint8_t num_firs;
 };
 
 /**
@@ -259,6 +287,13 @@ struct ifx_hppass_sar_adc_data {
 	adc_ifx_hppass_sar_fifo_callback_t fifo_callback;
 	void *fifo_callback_user_data;
 	struct ifx_hppass_event_callback fifo_err_cb;
+	adc_ifx_hppass_sar_fir_callback_t fir_callback;
+	void *fir_callback_user_data;
+	int16_t fir_coef[CY_HPPASS_FIR_NUM][CY_HPPASS_FIR_TAP_NUM];
+	int16_t fir_result_cache[CY_HPPASS_FIR_NUM];
+	uint32_t fir_valid_mask;
+	uint32_t fir_generic_mask;
+	bool conversion_pending;
 };
 
 /*
@@ -356,6 +391,71 @@ static void ifx_hppass_get_group_results(mem_addr_t ctrl_base, uint32_t channels
 	}
 }
 
+/* The output only stays inside 0..4095 when no tap is negative and they sum to at most one. */
+static bool ifx_hppass_sar_fir_fits_channel(const int16_t *coef)
+{
+	int32_t sum = 0;
+
+	for (uint8_t i = 0; i < CY_HPPASS_FIR_TAP_NUM; i++) {
+		if (coef[i] < 0) {
+			return false;
+		}
+		sum += coef[i];
+	}
+
+	return sum <= IFX_HPPASS_SAR_FIR_UNITY_GAIN;
+}
+
+/**
+ * @brief Append the filter outputs requested as channels 30/31
+ *
+ * Reading a filter does not trigger its input channel; the latest output it has
+ * produced is reported as-is.
+ */
+static int ifx_hppass_get_fir_results(uint32_t channels, struct ifx_hppass_sar_adc_data *data)
+{
+	uint32_t requested = channels & IFX_HPPASS_SAR_FIR_MSK;
+	unsigned int key;
+	uint32_t updated;
+
+	if (requested == 0U) {
+		return 0;
+	}
+
+	if ((data->fir_generic_mask & requested) != requested) {
+		LOG_ERR("FIR taps exceed the channel range; read it with the vendor API");
+		return -ENOTSUP;
+	}
+
+	key = irq_lock();
+
+	updated = Cy_HPPASS_SAR_Result_GetStatus() & requested;
+	for (uint8_t i = 0; i < CY_HPPASS_FIR_NUM; i++) {
+		uint32_t msk = CY_HPPASS_SAR_FIR_0_MSK << i;
+
+		if ((updated & msk) != 0U) {
+			data->fir_result_cache[i] = Cy_HPPASS_SAR_Result_FirRead(i);
+			data->fir_valid_mask |= msk;
+		}
+	}
+
+	if ((data->fir_valid_mask & requested) != requested) {
+		irq_unlock(key);
+		LOG_DBG("FIR has produced no result yet");
+		return -EAGAIN;
+	}
+
+	for (uint8_t i = 0; i < CY_HPPASS_FIR_NUM; i++) {
+		if ((requested & (CY_HPPASS_SAR_FIR_0_MSK << i)) != 0U) {
+			*data->buffer++ = (uint16_t)data->fir_result_cache[i];
+		}
+	}
+
+	irq_unlock(key);
+
+	return 0;
+}
+
 /**
  * @brief Start ADC conversion
  *
@@ -372,7 +472,10 @@ static void adc_context_start_sampling(struct adc_context *ctx)
 	const struct ifx_hppass_sar_adc_config *cfg = data->dev->config;
 	mem_addr_t ctrl_base = cfg->ctrl_base;
 	const struct adc_sequence *sequence = &ctx->sequence;
+	uint32_t adc_channels = sequence->channels & IFX_HPPASS_SAR_CHAN_MSK;
 	uint32_t result_status;
+	unsigned int key;
+	int ret;
 
 	data->repeat_buffer = data->buffer;
 	if (data->buffer == NULL || sequence->buffer_size == 0) {
@@ -383,8 +486,15 @@ static void adc_context_start_sampling(struct adc_context *ctx)
 	if (sequence->channels == 0) {
 		LOG_ERR("No channels specified");
 		adc_context_complete(&data->ctx, -EINVAL);
-	} else if (ifx_hppass_sar_configure_group(ctrl_base, sequence->channels, 0,
-						  CY_HPPASS_SAR_TRIG_0,
+	} else if (adc_channels == 0) {
+		/* Filters run off their input channel, so there is nothing to trigger. */
+		ret = ifx_hppass_get_fir_results(sequence->channels, data);
+		if (ret != 0) {
+			adc_context_complete(&data->ctx, ret);
+		} else {
+			adc_context_on_sampling_done(&data->ctx, data->dev);
+		}
+	} else if (ifx_hppass_sar_configure_group(ctrl_base, adc_channels, 0, CY_HPPASS_SAR_TRIG_0,
 						  data->grp_samp_sel[0]) != 0) {
 		LOG_ERR("Invalid channel group selection");
 		adc_context_complete(&data->ctx, -EINVAL);
@@ -392,9 +502,15 @@ static void adc_context_start_sampling(struct adc_context *ctx)
 		/* The sampler set just changed, so re-trim before triggering. */
 		Cy_HPPASS_SAR_CrossTalkAdjust(data->trig0_grp_msk);
 
-		/* Clear previous results before triggering the next conversion. */
-		sys_write32(sequence->channels & IFX_HPPASS_SAR_CHAN_MSK,
-			    ctrl_base + IFX_HPPASS_SAR_RESULT_UPDATED);
+		/* Clear a stale group-0 event and arm the flag before the trigger fires. */
+		key = irq_lock();
+		sys_write32(IFX_HPPASS_SAR_INTR_RESULT_GROUP(0),
+			    ctrl_base + IFX_HPPASS_SAR_RESULT_INTR);
+		(void)sys_read32(ctrl_base + IFX_HPPASS_SAR_RESULT_INTR);
+		sys_write32(adc_channels, ctrl_base + IFX_HPPASS_SAR_RESULT_UPDATED);
+		data->conversion_pending = true;
+		irq_unlock(key);
+
 		ifx_hppass_ac_set_fw_trigger_pulse(cfg->mfd, IFX_HPPASS_TRIG_0_MSK);
 
 #if defined(CONFIG_ADC_ASYNC)
@@ -414,8 +530,7 @@ static void adc_context_start_sampling(struct adc_context *ctx)
 			     i < CONFIG_ADC_INFINEON_HPPASS_SAR_POLL_TIMEOUT_US; i++) {
 				result_status =
 					sys_read32(ctrl_base + IFX_HPPASS_SAR_RESULT_UPDATED);
-				if ((result_status & sequence->channels) ==
-				    sequence->channels) {
+				if ((result_status & adc_channels) == adc_channels) {
 					completed = true;
 					break;
 				}
@@ -429,7 +544,14 @@ static void adc_context_start_sampling(struct adc_context *ctx)
 				return;
 			}
 
-			ifx_hppass_get_group_results(ctrl_base, sequence->channels, data);
+			ifx_hppass_get_group_results(ctrl_base, adc_channels, data);
+
+			ret = ifx_hppass_get_fir_results(sequence->channels, data);
+			if (ret != 0) {
+				adc_context_complete(&data->ctx, ret);
+				return;
+			}
+
 			adc_context_on_sampling_done(&data->ctx, data->dev);
 #if defined(CONFIG_ADC_ASYNC)
 		}
@@ -450,9 +572,13 @@ static void adc_context_update_buffer_pointer(struct adc_context *ctx, bool repe
 /* adc_context only stops the interval timer when a sequence finishes without error. */
 static void adc_context_on_complete(struct adc_context *ctx, int status)
 {
+	struct ifx_hppass_sar_adc_data *data =
+		CONTAINER_OF(ctx, struct ifx_hppass_sar_adc_data, ctx);
+
 	ARG_UNUSED(status);
 
 	adc_context_disable_timer(ctx);
+	data->conversion_pending = false;
 }
 
 /**
@@ -491,6 +617,12 @@ static int start_read(const struct device *dev, const struct adc_sequence *seque
 		return -EINVAL;
 	}
 
+	/* Catch an unreadable filter here so a mixed read does not convert first. */
+	if ((sequence->channels & IFX_HPPASS_SAR_FIR_MSK & ~data->fir_generic_mask) != 0U) {
+		LOG_ERR("FIR taps exceed the channel range; read it with the vendor API");
+		return -ENOTSUP;
+	}
+
 	if (sequence->oversampling != 0) {
 		LOG_ERR("Oversampling not supported");
 		return -EINVAL;
@@ -498,8 +630,10 @@ static int start_read(const struct device *dev, const struct adc_sequence *seque
 
 	/* adc_read only ever fires group 0; reject channels another group owns. */
 	if (cfg->num_groups > 0) {
+		uint32_t adc_channels = sequence->channels & IFX_HPPASS_SAR_CHAN_MSK;
+
 		if (cfg->groups[0].declared == true) {
-			if (sequence->channels & ~cfg->groups[0].channels) {
+			if (adc_channels & ~cfg->groups[0].channels) {
 				LOG_ERR("adc_read channels span outside group 0");
 				return -EINVAL;
 			}
@@ -509,7 +643,7 @@ static int start_read(const struct device *dev, const struct adc_sequence *seque
 					other_grp_channels |= cfg->groups[g].channels;
 				}
 			}
-			if (sequence->channels & other_grp_channels) {
+			if (adc_channels & other_grp_channels) {
 				LOG_ERR("adc_read channels overlap groups 1-7");
 				return -EINVAL;
 			}
@@ -552,18 +686,31 @@ static void ifx_hppass_sar_adc_isr(const struct device *dev)
 	if (result_intr_status & IFX_HPPASS_SAR_INTR_RESULT_GROUP(0)) {
 
 #if defined(CONFIG_ADC_ASYNC)
-		if (data->ctx.asynchronous) {
+		/*
+		 * ctx.asynchronous still describes the request that just finished, so
+		 * only the pending flag can say this event belongs to a live one.
+		 */
+		if (data->ctx.asynchronous && data->conversion_pending == true) {
 			const struct adc_sequence *sequence = &data->ctx.sequence;
+			uint32_t adc_channels = sequence->channels & IFX_HPPASS_SAR_CHAN_MSK;
 			uint32_t result_status =
 				sys_read32(ctrl_base + IFX_HPPASS_SAR_RESULT_UPDATED);
 
-			if ((result_status & sequence->channels) == sequence->channels) {
-				ifx_hppass_get_group_results(ctrl_base, sequence->channels, data);
-				sys_write32(result_status & sequence->channels &
-						    IFX_HPPASS_SAR_CHAN_MSK,
+			if ((result_status & adc_channels) == adc_channels) {
+				int ret;
+
+				data->conversion_pending = false;
+
+				ifx_hppass_get_group_results(ctrl_base, adc_channels, data);
+				sys_write32(result_status & adc_channels,
 					    ctrl_base + IFX_HPPASS_SAR_RESULT_UPDATED);
 
-				adc_context_on_sampling_done(&data->ctx, dev);
+				ret = ifx_hppass_get_fir_results(sequence->channels, data);
+				if (ret != 0) {
+					adc_context_complete(&data->ctx, ret);
+				} else {
+					adc_context_on_sampling_done(&data->ctx, dev);
+				}
 			} else {
 				/*
 				 * Not all channels have completed yet.  This shouldn't happen, if
@@ -574,6 +721,25 @@ static void ifx_hppass_sar_adc_isr(const struct device *dev)
 			}
 		}
 #endif /* CONFIG_ADC_ASYNC */
+	}
+
+	uint32_t fir_done = (result_intr_status & CY_HPPASS_INTR_SAR_RESULT_FIR) >>
+			    HPPASS_SAR_CFG_SAR_RESULT_INTR_FIR_DONE_Pos;
+
+	if (fir_done != 0U) {
+		struct ifx_hppass_sar_adc_data *fir_data = dev->data;
+		adc_ifx_hppass_sar_fir_callback_t callback;
+		void *user_data;
+		unsigned int key;
+
+		key = irq_lock();
+		callback = fir_data->fir_callback;
+		user_data = fir_data->fir_callback_user_data;
+		irq_unlock(key);
+
+		if (callback != NULL) {
+			callback(dev, fir_done, user_data);
+		}
 	}
 }
 
@@ -730,14 +896,30 @@ static int ifx_hppass_sar_adc_channel_setup(const struct device *dev,
 	struct ifx_hppass_sar_adc_data *data = dev->data;
 	mem_addr_t ctrl_base = cfg->ctrl_base;
 
-	if (channel_cfg->channel_id >= HPPASS_SAR_ADC_MAX_CHANNELS) {
-		LOG_ERR("Invalid channel ID: %d", channel_cfg->channel_id);
-		return -EINVAL;
-	}
-
 	if (channel_cfg->differential) {
 		LOG_ERR("Differential channels not supported");
 		return -ENOTSUP;
+	}
+
+	/* Filters have no sampler and no CHAN_CFG entry; the fir node holds their setup. */
+	if (channel_cfg->channel_id >= CY_HPPASS_SAR_FIR_0_IDX) {
+		uint8_t fir_idx = channel_cfg->channel_id - CY_HPPASS_SAR_FIR_0_IDX;
+
+		if (cfg->fir[fir_idx].declared != true) {
+			LOG_ERR("FIR %u is not described in devicetree", fir_idx);
+			return -ENOTSUP;
+		}
+
+		adc_context_lock(&data->ctx, false, NULL);
+		data->enabled_channels |= BIT(channel_cfg->channel_id);
+		adc_context_release(&data->ctx, 0);
+
+		return 0;
+	}
+
+	if (channel_cfg->channel_id >= HPPASS_SAR_ADC_MAX_CHANNELS) {
+		LOG_ERR("Invalid channel ID: %d", channel_cfg->channel_id);
+		return -EINVAL;
 	}
 
 	if (channel_cfg->gain != ADC_GAIN_1 && channel_cfg->gain != ADC_GAIN_3 &&
@@ -976,6 +1158,187 @@ int adc_ifx_hppass_sar_fifo_read_chan_id(const struct device *dev, uint8_t buf_i
 }
 
 /**
+ * @brief Build the PDL FIR structure from stored configuration
+ *
+ * Takes a copy of the coefficients rather than pointing at the caller's array,
+ */
+static void ifx_hppass_sar_fir_build(const struct ifx_hppass_sar_fir_config *fir,
+				     const int16_t *coef, cy_stc_hppass_fir_t *pdl_cfg)
+{
+	*pdl_cfg = (cy_stc_hppass_fir_t){
+		.chan = (cy_en_hppass_fir_chan_t)(fir->input_channel + 1U),
+		.waitTapInit = fir->wait_tap_init,
+		.limit = CY_HPPASS_SAR_LIMIT_DISABLED,
+		.result = true,
+		.fifo = (cy_en_hppass_fifo_t)fir->fifo_sel,
+	};
+
+	memcpy(pdl_cfg->coef, coef, sizeof(pdl_cfg->coef));
+}
+
+static int ifx_hppass_sar_fir_check(const struct ifx_hppass_sar_adc_config *cfg, uint8_t fir_idx)
+{
+	if (fir_idx >= CY_HPPASS_FIR_NUM) {
+		return -EINVAL;
+	}
+
+	if (cfg->fir[fir_idx].declared != true) {
+		return -ENOTSUP;
+	}
+
+	return 0;
+}
+
+/**
+ * @brief Read the latest FIR output (vendor API)
+ */
+int adc_ifx_hppass_sar_fir_read(const struct device *dev, uint8_t fir_idx, int16_t *result)
+{
+	const struct ifx_hppass_sar_adc_config *cfg = dev->config;
+	struct ifx_hppass_sar_adc_data *data = dev->data;
+	unsigned int key;
+	uint32_t msk;
+	int ret;
+
+	if (result == NULL) {
+		return -EINVAL;
+	}
+
+	ret = ifx_hppass_sar_fir_check(cfg, fir_idx);
+	if (ret != 0) {
+		return ret;
+	}
+
+	/*
+	 * FIR_RESULT resets to an undefined value (Reg TRM 20.1.17) and
+	 * wait-tap-init only decides when hardware starts writing to it, not
+	 * what was there before. RESULT_UPDATED (Reg TRM 20.1.19) latches once
+	 * hardware has written a real result, so it tells a latest result from a
+	 * stale register. Clearing it after the read marks the value consumed,
+	 * so the next read reports -EAGAIN until the following conversion.
+	 */
+	msk = CY_HPPASS_SAR_FIR_0_MSK << fir_idx;
+
+	key = irq_lock();
+
+	if ((Cy_HPPASS_SAR_Result_GetStatus() & msk) == 0U) {
+		irq_unlock(key);
+		return -EAGAIN;
+	}
+
+	*result = Cy_HPPASS_SAR_Result_FirRead(fir_idx);
+
+	/* Keep the snapshot readers going once this read takes the freshness away. */
+	data->fir_result_cache[fir_idx] = *result;
+	data->fir_valid_mask |= msk;
+
+	Cy_HPPASS_SAR_Result_ClearStatus(msk);
+
+	irq_unlock(key);
+
+	return 0;
+}
+
+/**
+ * @brief Load new FIR coefficients (vendor API)
+ */
+int adc_ifx_hppass_sar_fir_set_coefficients(const struct device *dev, uint8_t fir_idx,
+					    const int16_t *coef, size_t num_coef)
+{
+	const struct ifx_hppass_sar_adc_config *cfg = dev->config;
+	struct ifx_hppass_sar_adc_data *data = dev->data;
+	int16_t taps[CY_HPPASS_FIR_TAP_NUM] = {0};
+	cy_stc_hppass_fir_t pdl_cfg;
+	cy_en_hppass_status_t status;
+	unsigned int key;
+	int ret;
+
+	if (coef == NULL || num_coef == 0U || num_coef > CY_HPPASS_FIR_TAP_NUM) {
+		return -EINVAL;
+	}
+
+	ret = ifx_hppass_sar_fir_check(cfg, fir_idx);
+	if (ret != 0) {
+		return ret;
+	}
+
+	/* The filter always runs 16 taps, so a shorter response pads with zero.*/
+	memcpy(taps, coef, num_coef * sizeof(taps[0]));
+
+	ifx_hppass_sar_fir_build(&cfg->fir[fir_idx], taps, &pdl_cfg);
+
+	status = Cy_HPPASS_SAR_FirConfig(fir_idx, &pdl_cfg);
+	if (status != CY_HPPASS_SUCCESS) {
+		LOG_ERR("FIR %u: config rejected (PDL status 0x%08x)", fir_idx, (uint32_t)status);
+		return ((status == CY_HPPASS_AC_INVALID_STATE) ||
+			(status == CY_HPPASS_SAR_INVALID_STATE))
+			       ? -EBUSY
+			       : -EIO;
+	}
+
+	/* New taps invalidate the last result; make both read paths wait for a fresh one. */
+	key = irq_lock();
+	Cy_HPPASS_SAR_Result_ClearStatus(CY_HPPASS_SAR_FIR_0_MSK << fir_idx);
+	data->fir_valid_mask &= ~(CY_HPPASS_SAR_FIR_0_MSK << fir_idx);
+	if (ifx_hppass_sar_fir_fits_channel(taps) == true) {
+		data->fir_generic_mask |= CY_HPPASS_SAR_FIR_0_MSK << fir_idx;
+	} else {
+		data->fir_generic_mask &= ~(CY_HPPASS_SAR_FIR_0_MSK << fir_idx);
+	}
+	irq_unlock(key);
+
+	memcpy(data->fir_coef[fir_idx], taps, sizeof(data->fir_coef[fir_idx]));
+
+	return 0;
+}
+
+/**
+ * @brief Read back the programmed FIR coefficients (vendor API)
+ */
+int adc_ifx_hppass_sar_fir_get_coefficients(const struct device *dev, uint8_t fir_idx,
+					    int16_t *coef, size_t num_coef)
+{
+	const struct ifx_hppass_sar_adc_config *cfg = dev->config;
+	struct ifx_hppass_sar_adc_data *data = dev->data;
+	int ret;
+
+	if (coef == NULL || num_coef != CY_HPPASS_FIR_TAP_NUM) {
+		return -EINVAL;
+	}
+
+	ret = ifx_hppass_sar_fir_check(cfg, fir_idx);
+	if (ret != 0) {
+		return ret;
+	}
+
+	memcpy(coef, data->fir_coef[fir_idx], sizeof(data->fir_coef[fir_idx]));
+
+	return 0;
+}
+
+/**
+ * @brief Register/unregister the FIR result callback (vendor API)
+ */
+int adc_ifx_hppass_sar_fir_set_callback(const struct device *dev,
+					adc_ifx_hppass_sar_fir_callback_t callback, void *user_data)
+{
+	const struct ifx_hppass_sar_adc_config *cfg = dev->config;
+	struct ifx_hppass_sar_adc_data *data = dev->data;
+	unsigned int key;
+
+	if (cfg->num_firs == 0U) {
+		return -ENOTSUP;
+	}
+
+	key = irq_lock();
+	data->fir_callback = callback;
+	data->fir_callback_user_data = user_data;
+	irq_unlock(key);
+
+	return 0;
+}
+
+/**
  * @brief Initialize ADC device
  */
 static int ifx_hppass_sar_adc_init(const struct device *dev)
@@ -990,10 +1353,14 @@ static int ifx_hppass_sar_adc_init(const struct device *dev)
 	uint32_t shared_mux = 0;
 	uint8_t done_msk = 0;
 	uint8_t compensated_sets = 0;
+	uint32_t intr_mask = 0U;
 	cy_en_hppass_status_t status;
 	int ret;
 
 	data->dev = dev;
+	data->fir_valid_mask = 0U;
+	data->fir_generic_mask = 0U;
+	data->conversion_pending = false;
 
 	LOG_DBG("Initializing HPPASS SAR ADC");
 
@@ -1163,6 +1530,53 @@ static int ifx_hppass_sar_adc_init(const struct device *dev)
 		data->trig0_grp_msk = BIT(0);
 	}
 
+	for (uint8_t idx = 0; idx < CY_HPPASS_FIR_NUM; idx++) {
+		cy_stc_hppass_fir_t fir_cfg;
+		uint8_t chan;
+
+		if (cfg->fir[idx].declared != true) {
+			continue;
+		}
+
+		/*
+		 * A mux sampler is shared by four channels, so its power bit cannot
+		 * tell whether this particular channel was described.
+		 *
+		 * CHANNEL_SEL is +1 encoded, 0 means the filter is disabled.
+		 */
+		chan = cfg->fir[idx].input_channel;
+		if ((cfg->channel_mask & BIT(chan)) == 0U) {
+			LOG_ERR("FIR %u: channel %u has no enabled channel node", idx, chan);
+			return -EINVAL;
+		}
+
+		ifx_hppass_sar_fir_build(&cfg->fir[idx], cfg->fir[idx].coef, &fir_cfg);
+
+		status = Cy_HPPASS_SAR_FirConfig(idx, &fir_cfg);
+		if (status != CY_HPPASS_SUCCESS) {
+			LOG_ERR("Failed to configure FIR %u (PDL status 0x%08x)", idx,
+				(uint32_t)status);
+			return ((status == CY_HPPASS_AC_INVALID_STATE) ||
+				(status == CY_HPPASS_SAR_INVALID_STATE))
+				       ? -EBUSY
+				       : -EIO;
+		}
+
+		/*
+		 * RESULT_UPDATED is not guaranteed clear across a warm reset any more
+		 * than FIR_RESULT itself is not guaranteed clear, force it low so
+		 * adc_ifx_hppass_sar_fir_read() cannot mistake a stale set bit for this
+		 * boot's first real result.
+		 */
+		Cy_HPPASS_SAR_Result_ClearStatus(CY_HPPASS_SAR_FIR_0_MSK << idx);
+
+		if (ifx_hppass_sar_fir_fits_channel(cfg->fir[idx].coef) == true) {
+			data->fir_generic_mask |= CY_HPPASS_SAR_FIR_0_MSK << idx;
+		}
+
+		memcpy(data->fir_coef[idx], cfg->fir[idx].coef, sizeof(data->fir_coef[idx]));
+	}
+
 	/* Registers a callback on the shared MFD, so it runs once nothing else can fail. */
 	if (cfg->fifo_enabled == true) {
 		cy_stc_hppass_fifo_t fifo_cfg = {
@@ -1211,9 +1625,17 @@ static int ifx_hppass_sar_adc_init(const struct device *dev)
 	 * Only group 0 has a reader. ENTRY_DONE for the other groups would cost an
 	 * interrupt per conversion with nothing to do.
 	 */
-	sys_write32(IFX_HPPASS_SAR_INTR_RESULT_GROUP(0),
-		    cfg->ctrl_base + IFX_HPPASS_SAR_RESULT_INTR_MASK);
+	intr_mask = IFX_HPPASS_SAR_INTR_RESULT_GROUP(0);
 #endif /* CONFIG_ADC_ASYNC */
+
+	/* FIR_DONE shares this register with the group bits.*/
+	for (uint8_t idx = 0; idx < CY_HPPASS_FIR_NUM; idx++) {
+		if (cfg->fir[idx].result_interrupt == true) {
+			intr_mask |= CY_HPPASS_INTR_SAR_RESULT_FIR_0 << idx;
+		}
+	}
+
+	sys_write32(intr_mask, cfg->ctrl_base + IFX_HPPASS_SAR_RESULT_INTR_MASK);
 	cfg->irq_func();
 
 	adc_context_unlock_unconditionally(&data->ctx);
@@ -1360,18 +1782,77 @@ static int ifx_hppass_sar_adc_init(const struct device *dev)
 	))
 
 /*
- * Per-channel fifo-sel.  Channel nodes are the children that carry a fifo-sel property
+ * Per-channel fifo-sel.  Channel nodes are the children that carry both a
+ * fifo-sel and a reg; the fir nodes also have fifo-sel but no unit address.
  */
 #define IFX_CHAN_FIFO_SEL_ENTRY(child)                                                             \
-	COND_CODE_1(DT_NODE_HAS_PROP(child, fifo_sel), (                                           \
+	COND_CODE_1(UTIL_AND(DT_NODE_HAS_PROP(child, fifo_sel), DT_NODE_HAS_PROP(child, reg)), (   \
 		[DT_REG_ADDR(child)] = DT_PROP(child, fifo_sel),                                   \
 	), ())
 
 #define IFX_CHAN_FIFO_VALIDATE(child, n)                                                           \
-	COND_CODE_1(DT_NODE_HAS_PROP(child, fifo_sel), (                                           \
+	COND_CODE_1(UTIL_AND(DT_NODE_HAS_PROP(child, fifo_sel), DT_NODE_HAS_PROP(child, reg)), (   \
 		BUILD_ASSERT(DT_PROP(child, fifo_sel) <= IFX_FIFO_BUF_COUNT(n),                    \
 			     "fifo-sel selects a FIFO buffer not instantiated by fifo-levels");    \
+		BUILD_ASSERT(DT_REG_ADDR(child) < CY_HPPASS_SAR_CHAN_NUM ||                        \
+			     DT_PROP(child, fifo_sel) == 0,                                        \
+			     "route a filter to a FIFO with fifo-sel on its fir node");            \
 	), ())
+
+/*
+ * FIR child nodes fir-0 and fir-1.
+ */
+#define IFX_FIR_NODE(n, idx)   DT_INST_CHILD(n, fir_##idx)
+#define IFX_FIR_EXISTS(n, idx) DT_NODE_HAS_STATUS_OKAY(IFX_FIR_NODE(n, idx))
+
+#define IFX_FIR_COEF_ENTRY(node_id, prop, i) ((int16_t)DT_PROP_BY_IDX(node_id, prop, i))
+
+/* A DT cell that does not sign-extend into 16 bits would be silently truncated. */
+#define IFX_FIR_COEF_VALID(node_id, prop, i)                                                       \
+	BUILD_ASSERT((int32_t)DT_PROP_BY_IDX(node_id, prop, i) ==                                  \
+			     (int32_t)(int16_t)DT_PROP_BY_IDX(node_id, prop, i),                   \
+		     "FIR coefficient does not fit signed 16-bit Q1.15");
+
+#define IFX_FIR_CFG_ENTRY(n, idx)                                                                  \
+	IF_ENABLED(IFX_FIR_EXISTS(n, idx), (                                                       \
+		[idx] = {                                                                          \
+			.input_channel = DT_PROP(IFX_FIR_NODE(n, idx), infineon_input_channel),    \
+			.coef = { DT_FOREACH_PROP_ELEM_SEP(IFX_FIR_NODE(n, idx),                   \
+							   infineon_coefficients,                  \
+							   IFX_FIR_COEF_ENTRY, (,)) },             \
+			.fifo_sel = DT_PROP(IFX_FIR_NODE(n, idx), fifo_sel),                       \
+			.wait_tap_init = DT_PROP(IFX_FIR_NODE(n, idx), infineon_wait_tap_init),    \
+			.result_interrupt =                                                        \
+				DT_PROP(IFX_FIR_NODE(n, idx), infineon_result_interrupt),          \
+			.declared = true,                                                          \
+		},                                                                                 \
+	))
+
+#define IFX_FIR_COUNT(n) (IFX_FIR_EXISTS(n, 0) + IFX_FIR_EXISTS(n, 1))
+
+#define IFX_FIR_COEF_ABS(node_id, prop, i)                                                         \
+	((int32_t)(int16_t)DT_PROP_BY_IDX(node_id, prop, i) < 0                                    \
+		 ? -(int32_t)(int16_t)DT_PROP_BY_IDX(node_id, prop, i)                             \
+		 : (int32_t)(int16_t)DT_PROP_BY_IDX(node_id, prop, i))
+
+#define IFX_FIR_VALIDATE(n, idx)                                                                   \
+	IF_ENABLED(IFX_FIR_EXISTS(n, idx), (                                                       \
+		BUILD_ASSERT(DT_PROP_LEN(IFX_FIR_NODE(n, idx), infineon_coefficients) ==           \
+				     CY_HPPASS_FIR_TAP_NUM,                                        \
+			     "infineon,coefficients must have exactly 16 entries");                \
+		DT_FOREACH_PROP_ELEM(IFX_FIR_NODE(n, idx), infineon_coefficients,                  \
+				     IFX_FIR_COEF_VALID)                                           \
+		BUILD_ASSERT(DT_FOREACH_PROP_ELEM_SEP(IFX_FIR_NODE(n, idx),                        \
+						      infineon_coefficients,                       \
+						      IFX_FIR_COEF_ABS, (+)) <                     \
+				     IFX_HPPASS_SAR_FIR_GAIN_LIMIT,                                \
+			     "infineon,coefficients gain must stay below 8");                      \
+		BUILD_ASSERT(DT_PROP(IFX_FIR_NODE(n, idx), infineon_input_channel) <               \
+				     CY_HPPASS_SAR_CHAN_NUM,                                       \
+			     "infineon,input-channel must be a SAR channel 0-27");                 \
+		BUILD_ASSERT(DT_PROP(IFX_FIR_NODE(n, idx), fifo_sel) <= IFX_FIFO_BUF_COUNT(n),     \
+			     "fifo-sel selects a FIFO buffer not instantiated by fifo-levels");    \
+	))
 
 /* Device instantiation */
 #define IFX_HPPASS_SAR_ADC_INIT(n)                                                                 \
@@ -1379,6 +1860,8 @@ static int ifx_hppass_sar_adc_init(const struct device *dev)
 	IFX_GRP_FOREACH(n, IFX_GRP_VALIDATE)                                                       \
 	IFX_FIFO_CHECK(n)                                                                          \
 	DT_INST_FOREACH_CHILD_STATUS_OKAY_VARGS(n, IFX_CHAN_FIFO_VALIDATE, n)                      \
+	IFX_FIR_VALIDATE(n, 0)                                                                     \
+	IFX_FIR_VALIDATE(n, 1)                                                                     \
 	static void ifx_hppass_sar_adc_config_func_##n(void);                                      \
 	static const struct ifx_hppass_sar_adc_config ifx_hppass_sar_adc_config_##n = {            \
 		.mfd = DEVICE_DT_GET(DT_INST_PARENT(n)),                                           \
@@ -1386,6 +1869,7 @@ static int ifx_hppass_sar_adc_init(const struct device *dev)
 		.irq_func = ifx_hppass_sar_adc_config_func_##n,                                    \
 		.dir_samp_en_mask = IFX_HPPASS_SAR_DIR_MASK(n),                                    \
 		.mux_samp_en_mask = IFX_HPPASS_SAR_MUX_MASK(n),                                    \
+		.channel_mask = IFX_HPPASS_SAR_CHAN_MASK(n) & IFX_HPPASS_SAR_CHAN_MSK,             \
 		.vref_internal_source = DT_INST_PROP(n, ref_internal_source),                      \
 		.gain_cal = DT_INST_PROP(n, gain_cal),                                             \
 		.offset_cal = DT_INST_PROP(n, offset_cal),                                         \
@@ -1397,6 +1881,8 @@ static int ifx_hppass_sar_adc_init(const struct device *dev)
 		.fifo_chan_id = DT_INST_PROP(n, fifo_chan_id),                                     \
 		.fifo = IFX_FIFO_CFG(n),                                                           \
 		.chan_fifo_sel = {DT_INST_FOREACH_CHILD_STATUS_OKAY(n, IFX_CHAN_FIFO_SEL_ENTRY)},  \
+		.fir = {IFX_FIR_CFG_ENTRY(n, 0) IFX_FIR_CFG_ENTRY(n, 1)},                          \
+		.num_firs = IFX_FIR_COUNT(n),                                                      \
 	};                                                                                         \
 	static struct ifx_hppass_sar_adc_data ifx_hppass_sar_adc_data_##n = {                      \
 		ADC_CONTEXT_INIT_TIMER(ifx_hppass_sar_adc_data_##n, ctx),                          \
