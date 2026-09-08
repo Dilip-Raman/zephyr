@@ -1,0 +1,30 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 Infineon Technologies AG,
+# SPDX-FileCopyrightText: or an affiliate of Infineon Technologies AG. All rights reserved.
+#
+# SPDX-License-Identifier: Apache-2.0
+
+sample:
+  name: HPPASS SAR ADC FIR and FIFO sample
+common:
+  tags:
+    - adc
+  filter: dt_node_has_prop("/zephyr,user","io-channels")
+
+tests:
+  sample.boards.infineon.hppass_sar_fir_fifo:
+    platform_allow:
+      - kit_psc3m5_evk/psc3m5fds2afq1
+    integration_platforms:
+      - kit_psc3m5_evk/psc3m5fds2afq1
+    harness: console
+    timeout: 20
+    harness_config:
+      type: multi_line
+      regex:
+        - "ADC reading\\[\\d+\\]:"
+        - "- .+, channel \\d+: -?\\d+ = -?\\d+ mV"
+        - "FIFO: watermark event \\(status=0x[0-9a-fA-F]+\\)"
+        - "FIFO\\[0\\] RAW : \\d+ words -.*"
+        - "FIFO\\[1\\] FIR0: \\d+ words -.*"
+        - "FIFO\\[2\\] FIR1: \\d+ words -.*"
+        - "FIR\\[0\\]: -?\\d+"

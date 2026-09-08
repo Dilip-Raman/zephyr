@@ -1,0 +1,92 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 Infineon Technologies AG,
+ * SPDX-FileCopyrightText: or an affiliate of Infineon Technologies AG. All rights reserved.
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+#include <zephyr/dt-bindings/adc/adc.h>
+#include <zephyr/dt-bindings/adc/infineon-hppass-sar.h>
+
+/ {
+	zephyr,user {
+		io-channels = <&adc0 12>, <&adc0 30>;
+	};
+};
+
+&adc0 {
+	#address-cells = <1>;
+	#size-cells = <0>;
+	fifo-chan-id;
+
+	channel@c {
+		reg = <12>;
+		zephyr,acquisition-time = <ADC_ACQ_TIME_DEFAULT>;
+		zephyr,gain = "ADC_GAIN_1";
+		zephyr,reference = "ADC_REF_INTERNAL";
+		zephyr,resolution = <12>;
+		fifo-sel = <IFX_HPPASS_SAR_FIFO_0>;
+	};
+
+	/* FIR0 output, read back through adc_read() like any other channel. */
+	channel@1e {
+		reg = <IFX_HPPASS_SAR_FIR0_CHANNEL>;
+		zephyr,acquisition-time = <ADC_ACQ_TIME_DEFAULT>;
+		zephyr,gain = "ADC_GAIN_1";
+		zephyr,reference = "ADC_REF_INTERNAL";
+		zephyr,resolution = <12>;
+	};
+
+	sequencer {
+		compatible = "infineon,hppass-sar-sequencer";
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		/* Group 0: channel 12, FW trigger */
+		group@0 {
+			reg = <0>;
+			infineon,channel-mask = <0x00001000>;
+			infineon,trigger-source = <IFX_HPPASS_SAR_TRIG_0>;
+		};
+	};
+
+	/* 32 words split into four 8-word buffers, watermark at 4 samples each.
+	 * Buffer 0: the raw channel 12 result.
+	 * Buffer 1: FIR0 output, tagged as channel 30.
+	 * Buffer 2: FIR1 output, tagged as channel 31.
+	 * Buffer 3: unused.
+	 */
+	fifo {
+		compatible = "infineon,hppass-sar-fifo";
+		fifo-levels = <4 4 4 0>;
+	};
+
+	/* 16-tap moving average of channel 12, coefficients 1/16 in Q1.15.
+	 * Output lands in buffer 1 tagged as channel 30.
+	 */
+	fir-0 {
+		compatible = "infineon,hppass-sar-fir";
+		infineon,input-channel = <12>;
+		infineon,coefficients = <0x0800 0x0800 0x0800 0x0800
+					 0x0800 0x0800 0x0800 0x0800
+					 0x0800 0x0800 0x0800 0x0800
+					 0x0800 0x0800 0x0800 0x0800>;
+		infineon,wait-tap-init;
+		fifo-sel = <IFX_HPPASS_SAR_FIFO_1>;
+	};
+
+	/* 8-tap moving average of the same channel, coefficients 1/8 in Q1.15,
+	 * zero-padded to the full 16 taps.  Output lands in buffer 2 tagged as
+	 * channel 31.
+	 */
+	fir-1 {
+		compatible = "infineon,hppass-sar-fir";
+		infineon,input-channel = <12>;
+		infineon,coefficients = <0x1000 0x1000 0x1000 0x1000
+					 0x1000 0x1000 0x1000 0x1000
+					 0x0000 0x0000 0x0000 0x0000
+					 0x0000 0x0000 0x0000 0x0000>;
+		infineon,wait-tap-init;
+		fifo-sel = <IFX_HPPASS_SAR_FIFO_2>;
+	};
+};
