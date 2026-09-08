@@ -14,6 +14,7 @@
 #define ZEPHYR_INCLUDE_DRIVERS_ADC_INFINEON_HPPASS_SAR_H_
 
 #include <zephyr/device.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -132,6 +133,97 @@ typedef void (*adc_ifx_hppass_sar_fifo_callback_t)(const struct device *dev, uin
 int adc_ifx_hppass_sar_fifo_set_callback(const struct device *dev,
 					 adc_ifx_hppass_sar_fifo_callback_t callback,
 					 void *user_data);
+
+/**
+ * @brief Read the next new output of a FIR filter.
+ *
+ * Returns a filter result once and marks it consumed; a second read with no
+ * conversion in between returns -EAGAIN.  FIR output is signed, unlike a plain
+ * single-ended channel result.
+ *
+ * @param dev      ADC device (infineon,hppass-sar-adc instance).
+ * @param fir_idx  Filter index, 0 or 1.
+ * @param result   Pointer to store the filtered value.
+ *
+ * @retval 0 on success.
+ * @retval -EINVAL if parameters are invalid.
+ * @retval -EAGAIN if no new result is available yet, e.g. during the
+ *         infineon,wait-tap-init warm-up or before the next conversion.
+ * @retval -ENOTSUP if the instance has no matching fir-N node in devicetree.
+ */
+int adc_ifx_hppass_sar_fir_read(const struct device *dev, uint8_t fir_idx, int16_t *result);
+
+/**
+ * @brief Load new coefficients into a FIR filter.
+ *
+ * Coefficients are Q1.15 two's complement, so the value is the fraction scaled
+ * by 32768(2^15): 0.25 is 0x2000 and -0.25 is 0xE000.  The sum of their absolute
+ * values must stay below 8 or the 16-bit result overflows. ref ARC TRM 27.2.2.6
+ *
+ * The hardware refuses this while the AC is running, in which case nothing
+ * is written and the filter keeps its current coefficients.
+ *
+ * The filter always runs 16 taps, so a shorter response is padded with zeros.
+ *
+ * @note Values from devicetree are checked at build time; the caller owns
+ * that limit for coefficients computed at runtime.
+ *
+ * @param dev       ADC device (infineon,hppass-sar-adc instance).
+ * @param fir_idx   Filter index, 0 or 1.
+ * @param coef      Coefficient array, copied before use.
+ * @param num_coef  Number of coefficients supplied, 1 to 16.
+ *
+ * @retval 0 on success.
+ * @retval -EINVAL if parameters are invalid.
+ * @retval -ENOTSUP if the instance has no matching fir-N node in devicetree.
+ * @retval -EBUSY if the AC is running.
+ * @retval -EIO if the hardware rejected the configuration.
+ */
+int adc_ifx_hppass_sar_fir_set_coefficients(const struct device *dev, uint8_t fir_idx,
+					    const int16_t *coef, size_t num_coef);
+
+/**
+ * @brief Read back the coefficients currently programmed into a FIR filter.
+ *
+ * @param dev       ADC device (infineon,hppass-sar-adc instance).
+ * @param fir_idx   Filter index, 0 or 1.
+ * @param coef      Output array for the coefficients.
+ * @param num_coef  Must be 16, the full tap set the filter holds.
+ *
+ * @retval 0 on success.
+ * @retval -EINVAL if parameters are invalid.
+ * @retval -ENOTSUP if the instance has no matching fir-N node in devicetree.
+ */
+int adc_ifx_hppass_sar_fir_get_coefficients(const struct device *dev, uint8_t fir_idx,
+					    int16_t *coef, size_t num_coef);
+
+/**
+ * @brief FIR result interrupt callback type.
+ *
+ * Called from ISR context when a filter is enabled with result-interrupt.
+ * That is once per conversion of the source channel, so prefer
+ * routing the filter to a FIFO buffer when sampling continuously.
+ *
+ * @param dev        ADC device.
+ * @param fir_mask   Bit 0 for FIR 0, bit 1 for FIR 1.
+ * @param user_data  User data passed to adc_ifx_hppass_sar_fir_set_callback().
+ */
+typedef void (*adc_ifx_hppass_sar_fir_callback_t)(const struct device *dev, uint32_t fir_mask,
+						  void *user_data);
+
+/**
+ * @brief Register a callback for FIR result interrupts.
+ *
+ * @param dev        ADC device (infineon,hppass-sar-adc instance).
+ * @param callback   Callback function, or NULL to unregister.
+ * @param user_data  Pointer passed to the callback.
+ *
+ * @retval 0 on success.
+ * @retval -ENOTSUP if the instance has no fir-N node in devicetree.
+ */
+int adc_ifx_hppass_sar_fir_set_callback(const struct device *dev,
+					adc_ifx_hppass_sar_fir_callback_t callback,
+					void *user_data);
 
 /** @} */
 
