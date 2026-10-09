@@ -1,0 +1,16 @@
+# Copyright (c) 2026 Aerlync Labs Inc.
+#
+# SPDX-License-Identifier: Apache-2.0
+
+common:
+  tags:
+    - drivers
+    - dma
+  depends_on: dma
+
+tests:
+  drivers.dma.error_cases:
+    filter: dt_nodelabel_enabled("tst_dma0") or dt_node_has_prop("/zephyr,user", "dma-test-devs")
+    # TODO: Add more platforms as their DMA error reporting is verified
+    platform_allow:
+      - kit_psc3m5_evk/psc3m5fds2afq1
