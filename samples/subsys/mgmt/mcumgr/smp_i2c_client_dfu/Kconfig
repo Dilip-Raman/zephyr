@@ -1,0 +1,14 @@
+# Copyright (c) 2026 Aerlync Labs Inc.
+# SPDX-License-Identifier: Apache-2.0
+
+mainmenu "MCUmgr SMP I2C Client DFU Sample"
+
+config APP_DFU_IMAGE_FILE
+	string "Path to the signed MCUboot image to upload"
+	default ""
+	help
+	  Absolute path to a signed image (for example build/zephyr/zephyr.signed.bin)
+	  that this controller uploads to the target over I2C. When empty, a
+	  non-functional placeholder is compiled in so the sample still builds.
+
+source "Kconfig.zephyr"

@@ -1,0 +1,34 @@
+/*
+ * Copyright (c) 2026 Aerlync Labs Inc.
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * frdm_mcxn236 acting as the I2C controller for the DFU sample. Wire three
+ * lines across to the target board running zephyr,smp-i2c: SDA on header pin
+ * J2-18 (Arduino D14), SCL on J2-20 (Arduino D15), and ground on J3-14. The
+ * target uses the same pins, so it is pin J2-18 to J2-18, J2-20 to J2-20,
+ * and J3-14 to J3-14.
+ */
+
+/* Enable gpio0 for LED status indicators */
+&gpio0 {
+	status = "okay";
+};
+
+/* Parent LPFLEXCOMM5 container */
+&flexcomm5 {
+	status = "okay";
+};
+
+/* FlexComm5 configured in LPI2C controller mode */
+&flexcomm5_lpi2c5 {
+	pinctrl-0 = <&pinmux_flexcomm5_lpi2c>;
+	pinctrl-names = "default";
+	clock-frequency = <I2C_BITRATE_FAST>;
+	status = "okay";
+
+	smp_i2c_client: smp-i2c-client@55 {
+		compatible = "zephyr,smp-i2c-client";
+		reg = <0x55>;
+		status = "okay";
+	};
+};

@@ -1,0 +1,17 @@
+sample:
+  name: MCUmgr SMP I2C Client DFU Sample
+  description: Demonstrates over-the-wire DFU using the Zephyr SMP Client subsystem over I2C
+
+tests:
+  sample.mgmt.mcumgr.smp_i2c_client_dfu:
+    platform_allow:
+      - frdm_mcxn236
+    integration_platforms:
+      - frdm_mcxn236
+    build_only: true
+    tags:
+      - mcumgr
+      - smp
+      - i2c
+      - client
+      - dfu
