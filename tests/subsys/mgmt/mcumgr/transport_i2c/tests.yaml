@@ -1,0 +1,22 @@
+#
+# Copyright (c) 2026 Aerlync Labs Inc.
+#
+# SPDX-License-Identifier: Apache-2.0
+#
+common:
+  tags:
+    - mgmt
+    - mcumgr
+    - transport
+  harness: ztest
+tests:
+  mgmt.mcumgr.transport.i2c:
+    platform_allow:
+      - frdm_mcxn236
+      - native_sim
+    build_only: true
+  mgmt.mcumgr.transport.i2c.native_sim:
+    platform_allow:
+      - native_sim
+    filter: CONFIG_I2C_EMUL
+    build_only: false
